@@ -2,13 +2,14 @@
 // Created by lehoai on 2/4/26.
 //
 
-#ifndef UNTITLED_CSV_READER_H
-#define UNTITLED_CSV_READER_H
+#ifndef SIMDCSV_CSV_READER_H
+#define SIMDCSV_CSV_READER_H
 
 #include <cstdint>
 #include <string_view>
 #include <immintrin.h>
 #include <vector>
+#include <tuple>
 #include <thread>
 #include <atomic>
 #include "mmap.h"
@@ -29,9 +30,42 @@ inline uint32_t prefix_xor(uint32_t mask) {
 }
 
 inline std::string_view trim_quotes(const std::string_view sv) {
-    return sv.substr(1, sv.size() - 2);
+    if (sv.size() >= 2 && sv.front() == '"' && sv.back() == '"') {
+        return sv.substr(1, sv.size() - 2);
+    }
+    return sv;
 }
 
+// Parse header row and return: (col_count, headers, pointer after header line)
+inline std::tuple<int, std::vector<std::string_view>, const char*>
+parse_header_row(const char* data, const char* end) {
+    std::vector<std::string_view> headers;
+    const char* ptr = data;
+    const char* field_start = data;
+    bool in_quote = false;
+
+    while (ptr < end) {
+        char c = *ptr;
+        if (c == '"') {
+            in_quote = !in_quote;
+        } else if (!in_quote) {
+            if (c == ',' || c == '\n') {
+                headers.push_back(trim_quotes(std::string_view(field_start, ptr - field_start)));
+                field_start = ptr + 1;
+                if (c == '\n') {
+                    return {static_cast<int>(headers.size()), headers, ptr + 1};
+                }
+            }
+        }
+        ptr++;
+    }
+
+    // Handle last field if no trailing newline
+    if (field_start < end) {
+        headers.push_back(trim_quotes(std::string_view(field_start, end - field_start)));
+    }
+    return {static_cast<int>(headers.size()), headers, end};
+}
 
 namespace csv {
     class CsvReader {
@@ -46,24 +80,25 @@ namespace csv {
 template <typename RowCallback>
 void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
 
-    // TODO: hard code col num
-    constexpr int col_num = 100;
     const auto f_map = new csv::file::FMmap(file_path);
 
     const char *data = f_map->data();
     const size_t size = f_map->size();
+    const char* end = data + size;
 
-    const char* ptr = data; // start pos
-    const char* end = data + size; // end pos
+    // Auto-detect header and column count
+    auto [col_num, headers, data_start] = parse_header_row(data, end);
+
+    const char* ptr = data_start; // start after header row
 
     // PREFETCH THREAD
     // Track parser progress so prefetcher stays ahead
-    std::atomic<const char*> parser_pos{data};
+    std::atomic<const char*> parser_pos{data_start};
     std::atomic<bool> done{false};
 
     std::thread prefetcher([&]() {
         volatile char sink = 0;  // prevent optimization
-        const char* prefetch_ptr = data;
+        const char* prefetch_ptr = data_start;
 
         while (!done.load(std::memory_order_relaxed)) {
             // Stay PREFETCH_CHUNK ahead of parser
@@ -159,7 +194,8 @@ void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
             in_quote = !in_quote;
         } else if (!in_quote) {
             if (c == ',' || c == '\n') {
-                current_row[col_idx] = std::string_view(field_start, ptr - field_start);
+                current_row[col_idx] = trim_quotes(std::string_view(field_start, ptr - field_start));
+                col_idx++;
                 if (c == '\n') {
                     callback(current_row);
                     col_idx = 0;
@@ -170,10 +206,13 @@ void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
         ptr++;
     }
 
-    // Flush last line
-    if (field_start < end || col_idx > 0) {
-        if (field_start < end) current_row[col_idx] = std::string_view(field_start, end - field_start);
-        if (col_idx > 0 ) callback(current_row);
+    // Flush last line (if file doesn't end with newline)
+    if (field_start < end) {
+        current_row[col_idx] = trim_quotes(std::string_view(field_start, end - field_start));
+        col_idx++;
+    }
+    if (col_idx > 0) {
+        callback(current_row);
     }
 
     // Stop prefetcher thread
@@ -184,4 +223,4 @@ void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
     delete f_map;
 }
 
-#endif //UNTITLED_CSV_READER_H
+#endif //SIMDCSV_CSV_READER_H

@@ -2,8 +2,8 @@
 // Created by lehoai on 2/4/26.
 //
 
-#ifndef UNTITLED_MMAP_H
-#define UNTITLED_MMAP_H
+#ifndef SIMDCSV_MMAP_H
+#define SIMDCSV_MMAP_H
 
 // mmap for linux
 // use native C api to avoid double buffer
@@ -62,4 +62,4 @@ inline csv::file::FMmap::~FMmap() {
     if (fd != -1) close(fd);
 }
 
-#endif //UNTITLED_MMAP_H
+#endif //SIMDCSV_MMAP_H
