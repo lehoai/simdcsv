@@ -11,6 +11,13 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
 endif()
 
+if(WIN32)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
+
+    # Nếu vẫn lỗi, hãy thử dùng cờ mạnh tay hơn:
+    # set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+endif()
+
 add_executable(simdcsv main.cpp
         mmap.h
         csv_reader.h)

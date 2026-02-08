@@ -10,7 +10,7 @@ namespace fs = std::filesystem;
 
 class CsvReaderTest : public ::testing::Test {
 protected:
-    std::string test_dir;
+    std::filesystem::path test_dir;
 
     void SetUp() override {
         test_dir = fs::temp_directory_path() / "csv_test";
@@ -22,11 +22,11 @@ protected:
     }
 
     [[nodiscard]] std::string createTestFile(const std::string& content) const {
-        std::string path = test_dir + "/test.csv";
-        std::ofstream file(path);
+        auto path = test_dir / "test.csv";
+        std::ofstream file(path, std::ios::binary);
         file << content;
         file.close();
-        return path;
+        return path.string();
     }
 };
 
@@ -35,7 +35,7 @@ TEST_F(CsvReaderTest, BasicParsing) {
     std::string path = createTestFile("a,b,c\n1,2,3\n4,5,6\n");
 
     std::vector<std::vector<std::string>> rows;
-    csv::format format;
+    constexpr csv::format format;
 
     csv::CsvReader::parse(path.c_str(), format, [&](const std::string_view* row) {
         rows.push_back({std::string(row[0]), std::string(row[1]), std::string(row[2])});
@@ -52,10 +52,10 @@ TEST_F(CsvReaderTest, BasicParsing) {
 
 // Test quoted fields
 TEST_F(CsvReaderTest, QuotedFields) {
-    std::string path = createTestFile("name,value\n\"hello,world\",123\n");
+    const std::string path = createTestFile("name,value\n\"hello,world\",123\n");
 
     std::vector<std::pair<std::string, std::string>> rows;
-    csv::format format;
+    const csv::format format;
 
     csv::CsvReader::parse(path.c_str(), format, [&](const std::string_view* row) {
         rows.emplace_back(std::string(row[0]), std::string(row[1]));
