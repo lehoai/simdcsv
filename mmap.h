@@ -47,14 +47,14 @@ inline csv::file::FMmap::FMmap(const char *file_path) {
     _size = st.st_size;
 
     // native mmap
-    _data = static_cast<char *>(mmap(nullptr, _size, PROT_READ, MAP_SHARED, fd, 0));
+    _data = static_cast<char *>(mmap(nullptr, _size, PROT_READ, MAP_PRIVATE, fd, 0));
     if (_data == MAP_FAILED) {
         close(fd);
         throw std::runtime_error("Cannot map file");
     }
 
     // suggest kernel read contiguous, prefetch
-    madvise(_data, _size, MADV_SEQUENTIAL);
+    madvise(_data, _size, MADV_SEQUENTIAL | MADV_HUGEPAGE); // TODO: MADV_WILLNEED?
 }
 
 inline csv::file::FMmap::~FMmap() {

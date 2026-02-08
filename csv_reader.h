@@ -12,74 +12,99 @@
 #include <tuple>
 #include <thread>
 #include <atomic>
+#include <charconv>
+
 #include "mmap.h"
 
 constexpr size_t BUFFER_SIZE = 128 * 1024;
-constexpr size_t PREFETCH_CHUNK = 2 * 1024 * 1024;  // 2MB prefetch ahead
+constexpr size_t PREFETCH_CHUNK = 16 * 1024 * 1024;  // 16MB prefetch ahead
 constexpr size_t PAGE_SIZE = 4096;
+namespace csv {
 
-// Prefix XOR
-// ex: 00100100 -> 00111100
-inline uint32_t prefix_xor(uint32_t mask) {
-    mask ^= (mask << 1);
-    mask ^= (mask << 2);
-    mask ^= (mask << 4);
-    mask ^= (mask << 8);
-    mask ^= (mask << 16);
-    return mask;
-}
+    struct format {
+        char delimiter = ',';
+        char quote = '"';
+        int header_row =0;
+    };
 
-inline std::string_view trim_quotes(const std::string_view sv) {
-    if (sv.size() >= 2 && sv.front() == '"' && sv.back() == '"') {
-        return sv.substr(1, sv.size() - 2);
+    // Prefix XOR
+    // ex: 00100100 -> 00111100
+    inline uint32_t prefix_xor(uint32_t mask) {
+        mask ^= (mask << 1);
+        mask ^= (mask << 2);
+        mask ^= (mask << 4);
+        mask ^= (mask << 8);
+        mask ^= (mask << 16);
+        return mask;
     }
-    return sv;
-}
 
-// Parse header row and return: (col_count, headers, pointer after header line)
-inline std::tuple<int, std::vector<std::string_view>, const char*>
-parse_header_row(const char* data, const char* end) {
-    std::vector<std::string_view> headers;
-    const char* ptr = data;
-    const char* field_start = data;
-    bool in_quote = false;
+    // trim quote
+    inline std::string_view trim_quotes(const std::string_view sv, const csv::format& format) {
+        if (sv.size() >= 2 && sv.front() == format.quote && sv.back() == format.quote) {
+            return sv.substr(1, sv.size() - 2);
+        }
+        return sv;
+    }
 
-    while (ptr < end) {
-        char c = *ptr;
-        if (c == '"') {
-            in_quote = !in_quote;
-        } else if (!in_quote) {
-            if (c == ',' || c == '\n') {
-                headers.push_back(trim_quotes(std::string_view(field_start, ptr - field_start)));
-                field_start = ptr + 1;
-                if (c == '\n') {
-                    return {static_cast<int>(headers.size()), headers, ptr + 1};
+    // helper convert string_view to data
+    // std::from_chars for best performance
+    template<typename T>
+    inline T get(std::string_view sv) {
+        T value{};
+        std::from_chars(sv.data(), sv.data() + sv.size(), value);
+        return value;
+    }
+
+    // Parse header row and return: (col_count, headers, pointer after header line)
+    inline std::tuple<int, std::vector<std::string_view>, const char*>
+    parse_header_row(const char* data, const char* end, format format) {
+        std::vector<std::string_view> headers;
+        const char* ptr = data;
+        const char* field_start = data;
+        bool in_quote = false;
+        int header_row_idx = 0;
+
+
+        while (ptr < end) {
+            const char c = *ptr;
+            if (c == format.quote) {
+                in_quote = !in_quote;
+            } else if (!in_quote) {
+                if (c == format.delimiter || c == '\n') {
+                    if (header_row_idx == format.header_row) {
+                        headers.push_back(trim_quotes(std::string_view(field_start, ptr - field_start), format));
+                    }
+                    field_start = ptr + 1;
+                    if (c == '\n') {
+                        if (header_row_idx == format.header_row) {
+                            return {static_cast<int>(headers.size()), headers, ptr + 1};
+                        }
+                        header_row_idx++;
+                    }
                 }
             }
+            ptr++;
         }
-        ptr++;
+
+        // Handle last field if no trailing newline
+        if (field_start < end) {
+            headers.push_back(trim_quotes(std::string_view(field_start, end - field_start), format));
+        }
+        return {static_cast<int>(headers.size()), headers, end};
     }
 
-    // Handle last field if no trailing newline
-    if (field_start < end) {
-        headers.push_back(trim_quotes(std::string_view(field_start, end - field_start)));
-    }
-    return {static_cast<int>(headers.size()), headers, end};
-}
 
-namespace csv {
     class CsvReader {
     public:
         // using RowCallback = std::function<void(const std::vector<std::string_view>&)>;
 
         template <typename RowCallback>
-        static void parse(const char* file_path, const RowCallback &callback);
+        static void parse(const char* file_path, format format, const RowCallback &callback);
     };
 }
 
 template <typename RowCallback>
-void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
-
+void csv::CsvReader::parse(const char* file_path, const format format, const RowCallback &callback) {
     const auto f_map = new csv::file::FMmap(file_path);
 
     const char *data = f_map->data();
@@ -87,7 +112,7 @@ void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
     const char* end = data + size;
 
     // Auto-detect header and column count
-    auto [col_num, headers, data_start] = parse_header_row(data, end);
+    auto [col_num, headers, data_start] = parse_header_row(data, end, format);
 
     const char* ptr = data_start; // start after header row
 
@@ -119,9 +144,9 @@ void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
         (void)sink;  // suppress unused warning
     });
 
-    const __m256i v_comma = _mm256_set1_epi8(',');
+    const __m256i v_comma = _mm256_set1_epi8(format.delimiter);
     const __m256i v_newline = _mm256_set1_epi8('\n');
-    const __m256i v_quote = _mm256_set1_epi8('"');
+    const __m256i v_quote = _mm256_set1_epi8(format.quote);
 
     // std::vector<std::string_view> current_row;
     // current_row.reserve(col_num);
@@ -166,7 +191,7 @@ void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
         while (valid_sep_mask != 0) {
             const int offset = __builtin_ctz(valid_sep_mask);
             const char* found_pos = ptr +offset;
-            current_row[col_idx] = trim_quotes(std::string_view(field_start, found_pos - field_start));
+            current_row[col_idx] = trim_quotes(std::string_view(field_start, found_pos - field_start), format);
             col_idx++;
 
             // check current char is newline
@@ -190,11 +215,11 @@ void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
 
     // remain bytes
     while (ptr < end) {
-        if (char c = *ptr; c == '"') {
+        if (char c = *ptr; c == format.quote) {
             in_quote = !in_quote;
         } else if (!in_quote) {
-            if (c == ',' || c == '\n') {
-                current_row[col_idx] = trim_quotes(std::string_view(field_start, ptr - field_start));
+            if (c == format.delimiter || c == '\n') {
+                current_row[col_idx] = trim_quotes(std::string_view(field_start, ptr - field_start), format);
                 col_idx++;
                 if (c == '\n') {
                     callback(current_row);
@@ -208,7 +233,7 @@ void csv::CsvReader::parse(const char* file_path, const RowCallback &callback) {
 
     // Flush last line (if file doesn't end with newline)
     if (field_start < end) {
-        current_row[col_idx] = trim_quotes(std::string_view(field_start, end - field_start));
+        current_row[col_idx] = trim_quotes(std::string_view(field_start, end - field_start), format);
         col_idx++;
     }
     if (col_idx > 0) {

@@ -5,7 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -g")
 
-include_directories(/home/lehoai/Desktop/code/csv-parser-master/single_include)
+if(MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX2")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
+endif()
 
 add_executable(simdcsv main.cpp
         mmap.h
@@ -15,8 +19,5 @@ add_executable(simdcsv main.cpp
 find_package(Threads REQUIRED)
 target_link_libraries(simdcsv Threads::Threads)
 
-if(MSVC)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX2")
-else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
-endif()
+enable_testing()
+add_subdirectory(test)
