@@ -138,7 +138,8 @@ void csv::CsvReader::parse(const char* file_path, const format format, const Row
 
             // If we've prefetched far enough, yield CPU
             if (prefetch_ptr >= target) {
-                std::this_thread::yield();
+                // std::this_thread::yield();
+                _mm_pause();
             }
         }
         (void)sink;  // suppress unused warning
