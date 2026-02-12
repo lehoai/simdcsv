@@ -5,14 +5,13 @@
 #ifndef SIMDCSV_CSV_READER_H
 #define SIMDCSV_CSV_READER_H
 
-#include <cstdint>
 #include <string_view>
 #include <immintrin.h>
 #include <vector>
-#include <tuple>
 #include <thread>
 #include <atomic>
 #include <charconv>
+#include <optional>
 
 #include "mmap.h"
 
@@ -20,10 +19,10 @@ constexpr size_t BUFFER_SIZE = 128 * 1024;
 constexpr size_t PREFETCH_CHUNK = 16 * 1024 * 1024;  // 16MB prefetch ahead
 constexpr size_t PAGE_SIZE = 4096;
 namespace csv {
-
     struct format {
         char delimiter = ',';
-        char quote = '"';
+        char new_line = '\n';
+        std::optional<char> quote;
         int header_row =0;
     };
 
@@ -40,7 +39,10 @@ namespace csv {
 
     // trim quote
     inline std::string_view trim_quotes(const std::string_view sv, const csv::format& format) {
-        if (sv.size() >= 2 && sv.front() == format.quote && sv.back() == format.quote) {
+        if (!format.quote.has_value()) {
+            return sv;
+        }
+        if (sv.size() >= 2 && sv.front() == format.quote.value() && sv.back() == format.quote.value()) {
             return sv.substr(1, sv.size() - 2);
         }
         return sv;
@@ -55,65 +57,44 @@ namespace csv {
         return value;
     }
 
-    // Parse header row and return: (col_count, headers, pointer after header line)
-    inline std::tuple<int, std::vector<std::string_view>, const char*>
-    parse_header_row(const char* data, const char* end, format format) {
-        std::vector<std::string_view> headers;
-        const char* ptr = data;
-        const char* field_start = data;
-        bool in_quote = false;
-        int header_row_idx = 0;
-
-
-        while (ptr < end) {
-            const char c = *ptr;
-            if (c == format.quote) {
-                in_quote = !in_quote;
-            } else if (!in_quote) {
-                if (c == format.delimiter || c == '\n') {
-                    if (header_row_idx == format.header_row) {
-                        headers.push_back(trim_quotes(std::string_view(field_start, ptr - field_start), format));
-                    }
-                    field_start = ptr + 1;
-                    if (c == '\n') {
-                        if (header_row_idx == format.header_row) {
-                            return {static_cast<int>(headers.size()), headers, ptr + 1};
-                        }
-                        header_row_idx++;
-                    }
-                }
-            }
-            ptr++;
-        }
-
-        // Handle last field if no trailing newline
-        if (field_start < end) {
-            headers.push_back(trim_quotes(std::string_view(field_start, end - field_start), format));
-        }
-        return {static_cast<int>(headers.size()), headers, end};
-    }
-
 
     class CsvReader {
+    private:
+        const char* file_path = nullptr;
+        csv::format format;
+        std::unique_ptr<csv::file::FMmap> f_map;
+        const char* end = nullptr;
+        int col_num = 0;
+        const char* data_start = nullptr;
+        std::vector<std::string> headers;
+        inline void parse_header_row(const char* data);
     public:
-        // using RowCallback = std::function<void(const std::vector<std::string_view>&)>;
-
+        CsvReader(const char* file_path, csv::format format);
         template <typename RowCallback>
-        static void parse(const char* file_path, format format, const RowCallback &callback);
+        void parse(const RowCallback &callback);
+
+        std::vector<std::string> getHeaders() {
+            return headers;
+        }
     };
 }
 
-template <typename RowCallback>
-void csv::CsvReader::parse(const char* file_path, const format format, const RowCallback &callback) {
-    const auto f_map = new csv::file::FMmap(file_path);
+inline csv::CsvReader::CsvReader(const char *file_path, const csv::format format) {
+    this->file_path = file_path;
+    this->format = format;
+
+    f_map = std::make_unique<csv::file::FMmap>(file_path);
 
     const char *data = f_map->data();
     const size_t size = f_map->size();
-    const char* end = data + size;
+    this->end = data + size;
 
     // Auto-detect header and column count
-    auto [col_num, headers, data_start] = parse_header_row(data, end, format);
+    parse_header_row(data);
+}
 
+template <typename RowCallback>
+void csv::CsvReader::parse(const RowCallback &callback) {
     const char* ptr = data_start; // start after header row
 
     // PREFETCH THREAD
@@ -146,12 +127,12 @@ void csv::CsvReader::parse(const char* file_path, const format format, const Row
     });
 
     const __m256i v_comma = _mm256_set1_epi8(format.delimiter);
-    const __m256i v_newline = _mm256_set1_epi8('\n');
-    const __m256i v_quote = _mm256_set1_epi8(format.quote);
+    const __m256i v_newline = _mm256_set1_epi8(format.new_line);
+    const __m256i v_quote = format.quote.has_value() ? _mm256_set1_epi8(format.quote.value()) : _mm256_setzero_si256();
 
     // std::vector<std::string_view> current_row;
     // current_row.reserve(col_num);
-    auto current_row = new std::string_view[col_num];
+    auto current_row = std::make_unique<std::string_view[]>(col_num);
     int col_idx = 0;
 
     const char* field_start = ptr;
@@ -165,26 +146,30 @@ void csv::CsvReader::parse(const char* file_path, const format format, const Row
         // find comma, new line, quote parallel
         const __m256i cmp_comma = _mm256_cmpeq_epi8(chunk, v_comma);
         const __m256i cmp_newline = _mm256_cmpeq_epi8(chunk, v_newline);
-        const __m256i cmp_quote = _mm256_cmpeq_epi8(chunk, v_quote);
+
+        uint32_t quote_mask = 0;
+        uint32_t quote_solid_mask = 0;
+
+        if (format.quote.has_value()) {
+            const __m256i cmp_quote = _mm256_cmpeq_epi8(chunk, v_quote);
+            quote_mask = _mm256_movemask_epi8(cmp_quote);
+
+            // if in_quote = 1 -> (0 - 1) = -1 = 0xFFFFFFFF -> XOR result is NOT mask
+            // if in_quote = 0 -> (0 - 0) = 0  = 0x00000000 -> XOR result is mask (keep)
+            quote_solid_mask = prefix_xor(quote_mask);
+            quote_solid_mask ^= (0 - in_quote);
+            // calculate in_quote for next loop
+            // if number of quote is odd, XOR with 1
+            // else XOR with 0
+            in_quote ^= (_mm_popcnt_u32(quote_mask) & 1);
+        }
 
         // convert result to bitmask 32bit
-        const uint32_t quote_mask = _mm256_movemask_epi8(cmp_quote);
         const uint32_t comma_mask = _mm256_movemask_epi8(cmp_comma);
-        const uint32_t newline_mask    = _mm256_movemask_epi8(cmp_newline);
-
-        uint32_t quote_solid_mask = prefix_xor(quote_mask);
-
-        // if in_quote = 1 -> (0 - 1) = -1 = 0xFFFFFFFF -> XOR result is NOT mask
-        // if in_quote = 0 -> (0 - 0) = 0  = 0x00000000 -> XOR result is mask (keep)
-        quote_solid_mask ^= (0 - in_quote);
-
-        // calculate in_quote for next loop
-        // if number of quote is odd, XOR with 1
-        // else XOR with 0
-        in_quote ^= (_mm_popcnt_u32(quote_mask) & 1);
+        const uint32_t newline_mask = _mm256_movemask_epi8(cmp_newline);
 
         const uint32_t valid_comma_mask = comma_mask & ~quote_solid_mask;
-        const uint32_t valid_newline_mask    = newline_mask    & ~quote_solid_mask;
+        const uint32_t valid_newline_mask = newline_mask & ~quote_solid_mask;
 
         // get comma outside solid mask (outside quotation)
         uint32_t valid_sep_mask = valid_comma_mask | valid_newline_mask;
@@ -192,12 +177,21 @@ void csv::CsvReader::parse(const char* file_path, const format format, const Row
         while (valid_sep_mask != 0) {
             const int offset = __builtin_ctz(valid_sep_mask);
             const char* found_pos = ptr +offset;
-            current_row[col_idx] = trim_quotes(std::string_view(field_start, found_pos - field_start), format);
+            
+            if (col_idx < col_num) {
+                current_row[col_idx] = trim_quotes(std::string_view(field_start, found_pos - field_start), format);
+            }
             col_idx++;
 
             // check current char is newline
             if ((valid_newline_mask >> offset) & 1) {
-                callback(current_row);
+                // Lazy clear: only clear unfilled fields if row has fewer columns
+                if (col_idx < col_num) {
+                    for (int i = col_idx; i < col_num; i++) {
+                        current_row[i] = std::string_view();
+                    }
+                }
+                callback(current_row.get());
                 col_idx = 0;
             }
             field_start = found_pos + 1;
@@ -216,14 +210,23 @@ void csv::CsvReader::parse(const char* file_path, const format format, const Row
 
     // remain bytes
     while (ptr < end) {
-        if (char c = *ptr; c == format.quote) {
+        char c = *ptr;
+        if (format.quote.has_value() && c == format.quote.value()) {
             in_quote = !in_quote;
         } else if (!in_quote) {
-            if (c == format.delimiter || c == '\n') {
-                current_row[col_idx] = trim_quotes(std::string_view(field_start, ptr - field_start), format);
+            if (c == format.delimiter || c == format.new_line) {
+                if (col_idx < col_num) {
+                    current_row[col_idx] = trim_quotes(std::string_view(field_start, ptr - field_start), format);
+                }
                 col_idx++;
-                if (c == '\n') {
-                    callback(current_row);
+                if (c == format.new_line) {
+                    // Lazy clear: only clear unfilled fields if row has fewer columns
+                    if (col_idx < col_num) {
+                        for (int i = col_idx; i < col_num; i++) {
+                            current_row[i] = std::string_view();
+                        }
+                    }
+                    callback(current_row.get());
                     col_idx = 0;
                 }
                 field_start = ptr + 1;
@@ -234,19 +237,65 @@ void csv::CsvReader::parse(const char* file_path, const format format, const Row
 
     // Flush last line (if file doesn't end with newline)
     if (field_start < end) {
-        current_row[col_idx] = trim_quotes(std::string_view(field_start, end - field_start), format);
+        if (col_idx < col_num) {
+            current_row[col_idx] = trim_quotes(std::string_view(field_start, end - field_start), format);
+        }
         col_idx++;
     }
     if (col_idx > 0) {
-        callback(current_row);
+        // Lazy clear: only clear unfilled fields if last row has fewer columns
+        if (col_idx < col_num) {
+            for (int i = col_idx; i < col_num; i++) {
+                current_row[i] = std::string_view();
+            }
+        }
+        callback(current_row.get());
     }
 
     // Stop prefetcher thread
     done.store(true, std::memory_order_relaxed);
     prefetcher.join();
+}
 
-    delete[] current_row;
-    delete f_map;
+// Parse header row and return: (col_count, headers, pointer after header line)
+void csv::CsvReader::parse_header_row(const char* data) {
+    const char* ptr = data;
+    const char* field_start = data;
+    bool in_quote = false;
+    int header_row_idx = 0;
+
+
+    while (ptr < end) {
+        const char c = *ptr;
+        if (format.quote.has_value() && c == format.quote.value()) {
+            in_quote = !in_quote;
+        } else if (!in_quote) {
+            if (c == format.delimiter || c == format.new_line) {
+                if (header_row_idx == format.header_row) {
+                    std::string header {trim_quotes(std::string_view(field_start, ptr - field_start), format)};
+                    headers.push_back(header);
+                }
+                field_start = ptr + 1;
+                if (c == format.new_line) {
+                    if (header_row_idx == format.header_row) {
+                        this->col_num = static_cast<int>(headers.size());
+                        this->data_start = ptr + 1;
+                        return;
+                    }
+                    header_row_idx++;
+                }
+            }
+        }
+        ptr++;
+    }
+
+    // Handle last field if no trailing newline
+    if (field_start < end) {
+        std::string header {trim_quotes(std::string_view(field_start, end - field_start), format)};
+        headers.push_back(header);
+    }
+    this->col_num = static_cast<int>(headers.size());
+    this->data_start = end;
 }
 
 #endif //SIMDCSV_CSV_READER_H
