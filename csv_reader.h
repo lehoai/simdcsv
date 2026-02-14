@@ -9,14 +9,15 @@
 #include <immintrin.h>
 #include <vector>
 #include <thread>
-#include <atomic>
 #include <charconv>
 #include <optional>
+#include <mutex>
+#include <condition_variable>
 
 #include "mmap.h"
 
 constexpr size_t BUFFER_SIZE = 128 * 1024;
-constexpr size_t PREFETCH_CHUNK = 16 * 1024 * 1024;  // 16MB prefetch ahead
+constexpr size_t PREFETCH_CHUNK = 64 * 1024 * 1024;  // 64MB prefetch ahead
 constexpr size_t PAGE_SIZE = 4096;
 namespace csv {
     struct format {
@@ -99,29 +100,37 @@ void csv::CsvReader::parse(const RowCallback &callback) {
 
     // PREFETCH THREAD
     // Track parser progress so prefetcher stays ahead
-    std::atomic<const char*> parser_pos{data_start};
-    std::atomic<bool> done{false};
+    std::mutex prefetch_mtx;
+    std::condition_variable prefetch_cv;
+    bool advance_signal = false; // guarded by prefetch_mtx
+    bool done = false; // guarded by prefetch_mtx
 
     std::thread prefetcher([&]() {
         volatile char sink = 0;  // prevent optimization
         const char* prefetch_ptr = data_start;
+        const char* local_target = std::min(data_start + PREFETCH_CHUNK, end);
 
-        while (!done.load(std::memory_order_relaxed)) {
-            // Stay PREFETCH_CHUNK ahead of parser
-            const char* current_parser = parser_pos.load(std::memory_order_relaxed);
-            const char* target = std::min(current_parser + PREFETCH_CHUNK, end);
-
+        while (true) {
             // Touch pages to trigger page faults ahead of parser
-            while (prefetch_ptr < target) {
+            while (prefetch_ptr < local_target) {
                 sink += *prefetch_ptr;  // page fault
                 prefetch_ptr += PAGE_SIZE;
             }
 
-            // If we've prefetched far enough, yield CPU
-            if (prefetch_ptr >= target) {
-                // std::this_thread::yield();
-                _mm_pause();
+            if (prefetch_ptr >= end) break;
+
+            // sleep
+            {
+                std::unique_lock<std::mutex> lock(prefetch_mtx);
+                prefetch_cv.wait(lock, [&] {
+                    return advance_signal || done;
+                });
+
+                if (done) break;
+                advance_signal = false;
             }
+
+            local_target = std::min(prefetch_ptr + PREFETCH_CHUNK, end);
         }
         (void)sink;  // suppress unused warning
     });
@@ -204,7 +213,11 @@ void csv::CsvReader::parse(const RowCallback &callback) {
 
         // Update parser position for prefetcher (every 64KB to reduce overhead)
         if ((reinterpret_cast<uintptr_t>(ptr) & 0xFFFF) == 0) {
-            parser_pos.store(ptr, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(prefetch_mtx);
+                advance_signal = true;
+            }
+            prefetch_cv.notify_one(); // wakeup prefetcher
         }
     }
 
@@ -253,7 +266,11 @@ void csv::CsvReader::parse(const RowCallback &callback) {
     }
 
     // Stop prefetcher thread
-    done.store(true, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(prefetch_mtx);
+        done = true;
+    }
+    prefetch_cv.notify_one();
     prefetcher.join();
 }
 
