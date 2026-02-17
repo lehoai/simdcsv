@@ -1,35 +1,50 @@
 cmake_minimum_required(VERSION 3.14)
-project(simdcsv)
+project(simdcsv VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Optimization flags
-if(MSVC)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX2")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
-else()
-    # Use -march=native to auto-detect all CPU features (includes AVX2, BMI, etc.)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
-    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-endif()
+# ============================================================================
+# Create INTERFACE library (header-only library)
+# ============================================================================
+add_library(simdcsv INTERFACE)
+add_library(simdcsv::simdcsv ALIAS simdcsv)
 
-# Enable Link-Time Optimization for Release builds
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+# Include directories for the library
+target_include_directories(simdcsv INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:include>
+)
 
-if(WIN32)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
+# Optimization flags for users of the library
+target_compile_options(simdcsv INTERFACE
+    $<$<CXX_COMPILER_ID:MSVC>:/arch:AVX2>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-march=native>
+)
 
-    # Nếu vẫn lỗi, hãy thử dùng cờ mạnh tay hơn:
-    # set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
-endif()
+target_compile_definitions(simdcsv INTERFACE
+    $<$<CONFIG:Release>:NDEBUG>
+)
 
-add_executable(simdcsv main.cpp
-        mmap.h
-        csv_reader.h)
-
-# Link pthread for std::thread
+# Link Threads for the library
 find_package(Threads REQUIRED)
-target_link_libraries(simdcsv Threads::Threads)
+target_link_libraries(simdcsv INTERFACE Threads::Threads)
 
-enable_testing()
-add_subdirectory(test)
+# ============================================================================
+# Build tests only when this is the main project
+# (not when fetched by another project)
+# ============================================================================
+# Check if this is the top-level project or a subproject
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(SIMDCSV_IS_TOP_LEVEL ON)
+else()
+    set(SIMDCSV_IS_TOP_LEVEL OFF)
+endif()
+
+# Build tests by default only when top-level
+option(SIMDCSV_BUILD_TESTS "Build tests" ${SIMDCSV_IS_TOP_LEVEL})
+
+if(SIMDCSV_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(test)
+endif()
