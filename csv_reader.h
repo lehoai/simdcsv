@@ -105,6 +105,30 @@ void csv::CsvReader::parse(const RowCallback &callback) {
     bool advance_signal = false; // guarded by prefetch_mtx
     bool done = false; // guarded by prefetch_mtx
 
+    // RAII guard
+    struct ThreadGuard {
+        std::thread& t;
+        std::mutex& mtx;
+        std::condition_variable& cv;
+        bool& done_flag;
+
+        ThreadGuard(const ThreadGuard&) = delete;
+        ThreadGuard& operator=(const ThreadGuard&) = delete;
+        ThreadGuard(ThreadGuard&&) = delete;
+        ThreadGuard& operator=(ThreadGuard&&) = delete;
+
+        ~ThreadGuard() {
+            {
+                std::lock_guard lock(mtx);
+                done_flag = true;
+            }
+            cv.notify_one();
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    };
+
     std::thread prefetcher([&]() {
         volatile char sink = 0;  // prevent optimization
         const char* prefetch_ptr = data_start;
@@ -134,6 +158,8 @@ void csv::CsvReader::parse(const RowCallback &callback) {
         }
         (void)sink;  // suppress unused warning
     });
+
+    ThreadGuard guard{prefetcher, prefetch_mtx, prefetch_cv, done};
 
     const __m256i v_comma = _mm256_set1_epi8(format.delimiter);
     const __m256i v_newline = _mm256_set1_epi8(format.new_line);
@@ -265,13 +291,13 @@ void csv::CsvReader::parse(const RowCallback &callback) {
         callback(current_row.get());
     }
 
-    // Stop prefetcher thread
-    {
-        std::lock_guard lock(prefetch_mtx);
-        done = true;
-    }
-    prefetch_cv.notify_one();
-    prefetcher.join();
+    // // Stop prefetcher thread
+    // {
+    //     std::lock_guard lock(prefetch_mtx);
+    //     done = true;
+    // }
+    // prefetch_cv.notify_one();
+    // prefetcher.join();
 }
 
 // Parse header row and return: (col_count, headers, pointer after header line)
